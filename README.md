@@ -15,12 +15,8 @@
 `tlsmux` can be statically configured, or dynamically configured. With an API exposed back end clients can self register
 their frontends, or configure themselves as additional backends for an existing frontend.
 
-
-
-
 ## Configuration
 
 ```yaml
 port: 443
-
 ```

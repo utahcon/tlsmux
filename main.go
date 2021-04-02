@@ -14,6 +14,10 @@ import (
 	"sync"
 )
 
+const (
+	initVhostBufSize = 1024 // allocate 1 KB up front to try to avoid resizing
+)
+
 type loadTLSConfigFn func(certPath, keyPath string) (*tls.Config, error)
 
 type sharedConn struct {
@@ -25,7 +29,7 @@ type sharedConn struct {
 func newSharedConn(conn net.Conn) (*sharedConn, io.Reader) {
 	c := &sharedConn{
 		Conn:     conn,
-		vhostBuf: bytes.NewBuffer(make([]byte, 0, 1024)),
+		vhostBuf: bytes.NewBuffer(make([]byte, 0, initVhostBufSize)),
 	}
 
 	return c, io.TeeReader(conn, c.vhostBuf)
@@ -36,15 +40,17 @@ type Options struct {
 }
 
 type Configuration struct {
-	EnableRedirect  bool                 `yaml:"enable_redirect"`
+	Redirect        bool                 `yaml:"redirect"`
+	Protocol        string               `yaml:"protocol"`
 	Port            string               `yaml:"port"`
 	Frontends       map[string]*Frontend `yaml:"frontends"`
 	defaultFrontend *Frontend
 }
 
 func parseOpts() (*Options, error) {
+
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s <config file>\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-config <config file>]\n\n", os.Args[0])
 	}
 
 	options := &Options{}
@@ -62,9 +68,14 @@ func parseConfiguration(configBuf []byte, loadTLS loadTLSConfigFn) (config *Conf
 		return
 	}
 
+	if config.Protocol == "" {
+		fmt.Println("No protocol specified, falling back to default: tcp")
+		config.Protocol = "tcp"
+	}
+
 	if config.Port == "" {
-		err = fmt.Errorf("you must specify a port")
-		return
+		fmt.Println("No port specified, falling back to default :443")
+		config.Port = ":443"
 	}
 
 	if len(config.Frontends) == 0 {
@@ -89,6 +100,10 @@ func parseConfiguration(configBuf []byte, loadTLS loadTLSConfigFn) (config *Conf
 		for _, back := range front.Backends {
 			if back.ConnectTimeout == 0 {
 				back.ConnectTimeout = defaultConnectTimeout
+			}
+
+			if back.Protocol == "" {
+				back.Protocol = "tcp"
 			}
 
 			if back.Address == "" {
@@ -140,7 +155,7 @@ func main() {
 
 	s := &Server{
 		Configuration: config,
-		Logger:        log.New(os.Stdout, "tlsmux", log.LstdFlags|log.Lshortfile),
+		Logger:        log.New(os.Stdout, "tlsmux ", log.LstdFlags|log.Lshortfile),
 	}
 
 	err = s.Run()

@@ -5,6 +5,7 @@ const (
 )
 
 type Backend struct {
-	Address        string `yaml:"address"`
+	Protocol       string `yaml:"protocol"`
+	Address        string `yaml:"addr"`
 	ConnectTimeout int    `yaml:"timeout"`
 }

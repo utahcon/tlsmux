@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"net"
 	"strconv"
 )
 
@@ -11,22 +12,98 @@ type recordType uint8
 
 type alert uint8
 
-const (
-	maxPlaintext    = 16384
-	maxCiphertext   = 16384 + 2048
-	recordHeaderLen = 5
-	maxHandshake    = 65536
+type block struct {
+	data []byte
+	off  int
+}
 
-	statusTypeOCSP uint8 = 1
+func (b *block) resize(n int) {
+	if n > cap(b.data) {
+		b.reserve(n)
+	}
+	b.data = b.data[0:n]
+}
+
+func (b *block) reserve(n int) {
+	if cap(b.data) >= n {
+		return
+	}
+
+	m := cap(b.data)
+	if m == 0 {
+		m = 1024
+	}
+	for m < n {
+		m *= 2
+	}
+	data := make([]byte, len(b.data), m)
+	copy(data, b.data)
+	b.data = data
+}
+
+func (b *block) readFromUntil(r io.Reader, n int) error {
+	if len(b.data) >= n {
+		return nil
+	}
+
+	b.reserve(n)
+	for {
+		m, err := r.Read(b.data[len(b.data):cap(b.data)])
+		b.data = b.data[0 : len(b.data)+m]
+		if len(b.data) >= n {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *block) Read(p []byte) (n int, err error) {
+	n = copy(p, b.data[b.off:])
+	b.off += n
+	return
+}
+
+func newBlock() *block {
+	return new(block)
+}
+
+func splitBlock(b *block, n int) (*block, *block) {
+	if len(b.data) <= n {
+		return b, nil
+	}
+
+	bb := newBlock()
+	bb.resize(len(b.data) - n)
+	copy(bb.data, b.data[n:])
+	b.data = b.data[0:n]
+	return b, bb
+}
+
+const (
+	maxPlaintext    = 16384 // maximum plaintext payload length
+	maxCiphertext   = 20432 // maximum cyphertext payload length
+	recordHeaderLen = 5     // record header length
+	maxHandshake    = 65536 // maximum handshake supported (protocol max is 16MB)
+
+	alertUnexpectedMessage alert = 10
+	alertRecordOverflow    alert = 22
+	alertInternalError     alert = 80
 
 	recordTypeHandshake recordType = 22
 
 	typeClientHello uint8 = 1
 
-	alertUnexpectedMessage alert = 10
-	alertRecordOverflow    alert = 22
-	alertInternalError     alert = 80
+	statusTypeOCSP uint8 = 1
 )
+
+var alertText = map[alert]string{
+	alertUnexpectedMessage: "unexpected message",
+	alertRecordOverflow:    "record overflow",
+	alertInternalError:     "internal error",
+}
 
 var (
 	extensionServerName      uint16 = 0
@@ -36,12 +113,6 @@ var (
 	extensionSessionTicket   uint16 = 35
 	extensionNextProtoNeg    uint16 = 13172 // not IANA assigned
 )
-
-var alertText = map[alert]string{
-	alertUnexpectedMessage: "unexpected message",
-	alertRecordOverflow:    "record overflow",
-	alertInternalError:     "internal error",
-}
 
 func (e alert) String() string {
 	s, ok := alertText[e]
@@ -54,7 +125,8 @@ func (e alert) String() string {
 func (e alert) Error() string {
 	return e.String()
 }
-type ClientHelloMsg struct {
+
+type ClientHelloMessage struct {
 	Raw                []byte
 	Vers               uint16
 	Random             []byte
@@ -70,7 +142,126 @@ type ClientHelloMsg struct {
 	SessionTicket      []uint8
 }
 
-func (m *ClientHelloMsg) unmarshal(data []byte) bool {
+type TLSConn struct {
+	*sharedConn
+	ClientHelloMessage *ClientHelloMessage
+}
+
+func (c *TLSConn) Host() string {
+	if c.ClientHelloMessage == nil {
+		return ""
+	}
+	return c.ClientHelloMessage.ServerName
+}
+
+func (c *TLSConn) Free() {
+	c.ClientHelloMessage = nil
+}
+
+func TLS(conn net.Conn) (tlsConn *TLSConn, err error) {
+	c, rd := newSharedConn(conn)
+
+	tlsConn = &TLSConn{sharedConn: c}
+	if tlsConn.ClientHelloMessage, err = readClientHello(rd); err != nil {
+		return
+	}
+
+	return
+}
+
+func readClientHello(rd io.Reader) (*ClientHelloMessage, error) {
+	var nextBlock *block  // raw input, right off the wire
+	var hand bytes.Buffer // handshake data waiting to be read
+
+	// readRecord reads the next TLS record from the connection
+	// and updates the record layer state.
+	readRecord := func() error {
+		// Caller must be in sync with connection:
+		// handshake data if handshake not yet completed,
+		// else application data.  (We don't support renegotiation.)
+		if nextBlock == nil {
+			nextBlock = newBlock()
+		}
+		b := nextBlock
+
+		// Read header, payload.
+		if err := b.readFromUntil(rd, recordHeaderLen); err != nil {
+			return err
+		}
+		typ := recordType(b.data[0])
+
+		// No valid TLS record has a type of 0x80, however SSLv2 handshakes
+		// start with a uint16 length where the MSB is set and the first record
+		// is always < 256 bytes long. Therefore typ == 0x80 strongly suggests
+		// an SSLv2 client.
+		if typ == 0x80 {
+			return errors.New("tls: unsupported SSLv2 handshake received")
+		}
+
+		vers := uint16(b.data[1])<<8 | uint16(b.data[2])
+		n := int(b.data[3])<<8 | int(b.data[4])
+		if n > maxCiphertext {
+			return alertRecordOverflow
+		}
+
+		// First message, be extra suspicious:
+		// this might not be a TLS client.
+		// Bail out before reading a full 'body', if possible.
+		// The current max version is 3.1.
+		// If the version is >= 16.0, it's probably not real.
+		// Similarly, a clientHello message encodes in
+		// well under a kilobyte.  If the length is >= 12 kB,
+		// it's probably not real.
+		if (typ != recordTypeHandshake) || vers >= 0x1000 || n >= 0x3000 {
+			return alertUnexpectedMessage
+		}
+
+		if err := b.readFromUntil(rd, recordHeaderLen+n); err != nil {
+			return err
+		}
+
+		// Process message.
+		b, nextBlock = splitBlock(b, recordHeaderLen+n)
+		b.off = recordHeaderLen
+		data := b.data[b.off:]
+		if len(data) > maxPlaintext {
+			return alertRecordOverflow
+		}
+
+		hand.Write(data)
+
+		return nil
+	}
+
+	if err := readRecord(); err != nil {
+		return nil, err
+	}
+
+	data := hand.Bytes()
+	n := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
+	if n > maxHandshake {
+		return nil, alertInternalError
+	}
+	for hand.Len() < 4+n {
+		if err := readRecord(); err != nil {
+			return nil, err
+		}
+	}
+
+	data = hand.Next(4 + n)
+	if data[0] != typeClientHello {
+		return nil, alertUnexpectedMessage
+	}
+
+	msg := new(ClientHelloMessage)
+	if !msg.unmarshal(data) {
+		return nil, alertUnexpectedMessage
+	}
+
+	return msg, nil
+}
+
+func (m *ClientHelloMessage) unmarshal(data []byte) bool {
 	if len(data) < 42 {
 		return false
 	}
@@ -206,164 +397,4 @@ func (m *ClientHelloMsg) unmarshal(data []byte) bool {
 	}
 
 	return true
-}
-
-type block struct {
-	data []byte
-	off  int
-}
-
-func (b *block) resize(n int) {
-	if n > cap(b.data) {
-		b.reserve(n)
-	}
-	b.data = b.data[0:n]
-}
-
-func (b *block) reserve(n int) {
-	if cap(b.data) >= n {
-		return
-	}
-	m := cap(b.data)
-	if m == 0 {
-		m = 1024
-	}
-	for m < n {
-		m *= 2
-	}
-	data := make([]byte, len(b.data), m)
-	copy(data, b.data)
-	b.data = data
-}
-
-func (b *block) readFromUntil(r io.Reader, n int) error {
-	if len(b.data) >= n {
-		return nil
-	}
-
-	b.reserve(n)
-	for {
-		m, err := r.Read(b.data[len(b.data):cap(b.data)])
-		b.data = b.data[0 : len(b.data)+m]
-		if len(b.data) >= n {
-			break
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (b *block) Read(p []byte) (n int, err error) {
-	n = copy(p, b.data[b.off:])
-	b.off += n
-	return
-}
-
-func splitBlock(b *block, n int) (*block, *block) {
-	if len(b.data) <= n {
-		return b, nil
-	}
-	bb := newBlock()
-	bb.resize(len(b.data) - n)
-	copy(bb.data, b.data[n:])
-	b.data = b.data[0:n]
-	return b, bb
-}
-
-func newBlock() *block {
-	return new(block)
-}
-
-func readClientHello(rd io.Reader) (*ClientHelloMsg, error) {
-	var nextBlock *block  // raw input, right off the wire
-	var hand bytes.Buffer // handshake data waiting to be read
-
-	// readRecord reads the next TLS record from the connection
-	// and updates the record layer state.
-	readRecord := func() error {
-		// Caller must be in sync with connection:
-		// handshake data if handshake not yet completed,
-		// else application data.  (We don't support renegotiation.)
-		if nextBlock == nil {
-			nextBlock = newBlock()
-		}
-		b := nextBlock
-
-		// Read header, payload.
-		if err := b.readFromUntil(rd, recordHeaderLen); err != nil {
-			return err
-		}
-		typ := recordType(b.data[0])
-
-		// No valid TLS record has a type of 0x80, however SSLv2 handshakes
-		// start with a uint16 length where the MSB is set and the first record
-		// is always < 256 bytes long. Therefore typ == 0x80 strongly suggests
-		// an SSLv2 client.
-		if typ == 0x80 {
-			return errors.New("tls: unsupported SSLv2 handshake received")
-		}
-
-		vers := uint16(b.data[1])<<8 | uint16(b.data[2])
-		n := int(b.data[3])<<8 | int(b.data[4])
-		if n > maxCiphertext {
-			return alertRecordOverflow
-		}
-
-		// First message, be extra suspicious:
-		// this might not be a TLS client.
-		// Bail out before reading a full 'body', if possible.
-		// The current max version is 3.1.
-		// If the version is >= 16.0, it's probably not real.
-		// Similarly, a clientHello message encodes in
-		// well under a kilobyte.  If the length is >= 12 kB,
-		// it's probably not real.
-		if (typ != recordTypeHandshake) || vers >= 0x1000 || n >= 0x3000 {
-			return alertUnexpectedMessage
-		}
-
-		if err := b.readFromUntil(rd, recordHeaderLen+n); err != nil {
-			return err
-		}
-
-		// Process message.
-		b, nextBlock = splitBlock(b, recordHeaderLen+n)
-		b.off = recordHeaderLen
-		data := b.data[b.off:]
-		if len(data) > maxPlaintext {
-			return alertRecordOverflow
-		}
-
-		hand.Write(data)
-
-		return nil
-	}
-
-	if err := readRecord(); err != nil {
-		return nil, err
-	}
-
-	data := hand.Bytes()
-	n := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
-	if n > maxHandshake {
-		return nil, alertInternalError
-	}
-	for hand.Len() < 4+n {
-		if err := readRecord(); err != nil {
-			return nil, err
-		}
-	}
-
-	data = hand.Next(4 + n)
-	if data[0] != typeClientHello {
-		return nil, alertUnexpectedMessage
-	}
-
-	msg := new(ClientHelloMsg)
-	if !msg.unmarshal(data) {
-		return nil, alertUnexpectedMessage
-	}
-
-	return msg, nil
 }
